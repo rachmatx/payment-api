@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log
+.env
+data/database.sqlite
+.git
+.gitignore
+README.md
+dokumentasi_payment_api.md
