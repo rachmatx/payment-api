@@ -27,10 +27,13 @@ Karena Payment API adalah aplikasi Node.js yang berdiri sendiri, Anda harus meny
    ```bash
    npm install
    ```
-3. Ubah nama file `.env.example` menjadi `.env` (jika ada), lalu atur port jika diperlukan:
+3. Ubah nama file `.env.example` menjadi `.env` (jika ada), lalu atur port dan *Callback URL* (*Webhook*) jika diperlukan:
    ```ini
    PORT=3000
+   CALLBACK_URL=http://localhost/laundry_app/public/webhook/payment
    ```
+   > [!TIP]
+   > Variabel `CALLBACK_URL` di `.env` (jika diisi) akan otomatis mengganti URL Webhook pada database `merchants` setiap kali API dinyalakan ulang. Ini sangat berguna jika Anda berpindah-pindah lingkungan pengembangan (Lokal vs Cloud) tanpa harus repot mengedit database SQLite.
 
 ### B. Mendapatkan API Key & Mengatur URL Webhook (Database Seed)
 API ini menggunakan database SQLite (`src/db/database.sqlite`). Untuk bisa menggunakannya, Anda butuh entitas *Merchant* (Toko) yang memiliki **API Key** unik.
@@ -141,11 +144,12 @@ Meskipun database Anda sudah "Lunas" karena ditebak oleh Webhook, halaman web Ka
 2. **Pasang Script ini di Halaman HTML/View Kasir Anda:**
 ```javascript
 // Cek ke server setiap 3 detik
-setInterval(function() {
+let interval = setInterval(function() {
     fetch('/transaksi/cek_status_bayar/001')
         .then(response => response.json())
         .then(data => {
             if(data.sisa_tagihan <= 0) {
+                clearInterval(interval);
                 // Tampilkan SweetAlert yang keren
                 Swal.fire({
                     title: 'Pembayaran Berhasil!',
@@ -160,6 +164,12 @@ setInterval(function() {
         });
 }, 3000);
 ```
+
+---
+
+## 🚀 Fitur & Pembaruan Terkini (Changelog)
+
+1. **Dynamic Callback URL**: Penambahan fitur pembacaan URL Webhook dinamis langsung dari _Environment Variable_ (`CALLBACK_URL`). Mempermudah _deployment_ Railway/Vercel karena developer tak perlu meng-_update_ tabel `merchants` di dalam SQLite secara manual saat alamat aplikasi utama (PHP) berubah-ubah. API akan secara otomatis memperbarui URL pada *database* saat inisiasi server.
 
 Dengan langkah-langkah di atas, aplikasi Anda akan beroperasi seakan-akan terhubung langsung dengan sistem pembayaran kelas atas seperti yang digunakan di minimarket!
 
