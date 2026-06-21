@@ -66,8 +66,8 @@ router.post('/:id/pay', authenticateMerchant, async (req, res) => {
   try {
     const db = await getDb();
     const transaction = await db.get(
-      'SELECT * FROM transactions WHERE id = ? AND merchant_id = ?', 
-      [id, merchant.id]
+      'SELECT * FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC LIMIT 1', 
+      [id, id, merchant.id]
     );
 
     if (!transaction) {
@@ -80,11 +80,11 @@ router.post('/:id/pay', authenticateMerchant, async (req, res) => {
       });
     }
     if (new Date() > new Date(transaction.expired_at)) {
-      await db.run('UPDATE transactions SET status = ? WHERE id = ?', ['EXPIRED', id]);
+      await db.run('UPDATE transactions SET status = ? WHERE id = ?', ['EXPIRED', transaction.id]);
       return res.status(410).json({ success: false, error: 'Transaksi sudah expired' });
     }
 
-    const { alreadyProcessed, isSuccess } = await verifyPayment(id);
+    const { alreadyProcessed, isSuccess } = await verifyPayment(transaction.id);
 
     if (alreadyProcessed) {
       return res.status(409).json({ success: false, error: 'Sudah diproses' });
@@ -94,16 +94,16 @@ router.post('/:id/pay', authenticateMerchant, async (req, res) => {
       const paidAt = new Date().toISOString();
       await db.run(
         'UPDATE transactions SET status = ?, paid_at = ? WHERE id = ?', 
-        ['SUCCESS', paidAt, id]
+        ['SUCCESS', paidAt, transaction.id]
       );
       
-      const updatedTrx = await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
+      const updatedTrx = await db.get('SELECT * FROM transactions WHERE id = ?', [transaction.id]);
       sendCallback(updatedTrx, merchant);
 
       return res.json({
         success: true,
         data: {
-          transaction_id: id,
+          transaction_id: transaction.id,
           status: 'SUCCESS',
           amount: transaction.amount,
           method: transaction.method,
@@ -111,9 +111,22 @@ router.post('/:id/pay', authenticateMerchant, async (req, res) => {
         }
       });
     } else {
-      await db.run('UPDATE transactions SET status = ? WHERE id = ?', ['FAILED', id]);
+      await db.run('UPDATE transactions SET status = ? WHERE id = ?', ['FAILED', transaction.id]);
       return res.status(402).json({ success: false, error: 'Pembayaran gagal diverifikasi' });
     }
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/', authenticateMerchant, async (req, res) => {
+  try {
+    const db = await getDb();
+    const transactions = await db.all(
+      'SELECT id, amount, method, status, created_at, paid_at FROM transactions WHERE merchant_id = ? ORDER BY created_at DESC LIMIT 10',
+      [req.merchant.id]
+    );
+    res.json({ success: true, data: transactions });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -123,8 +136,8 @@ router.get('/:id/status', authenticateMerchant, async (req, res) => {
   try {
     const db = await getDb();
     const transaction = await db.get(
-      'SELECT id, amount, method, status, paid_at, expired_at FROM transactions WHERE id = ? AND merchant_id = ?',
-      [req.params.id, req.merchant.id]
+      'SELECT id, amount, method, status, payment_detail, paid_at, expired_at FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC LIMIT 1',
+      [req.params.id, req.params.id, req.merchant.id]
     );
 
     if (!transaction) {
@@ -142,22 +155,78 @@ router.post('/:id/confirm', authenticateMerchant, async (req, res) => {
   
   try {
     const db = await getDb();
-    const transaction = await db.get('SELECT * FROM transactions WHERE id = ? AND merchant_id = ?', [id, req.merchant.id]);
+    const transaction = await db.get(
+      'SELECT * FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC LIMIT 1', 
+      [id, id, req.merchant.id]
+    );
 
-    if (!transaction || transaction.status !== 'PENDING') {
-      return res.status(400).json({ success: false, error: 'Tidak bisa dikonfirmasi' });
+    if (!transaction) {
+      return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
+    }
+    if (transaction.status !== 'PENDING') {
+      return res.status(409).json({ success: false, error: `Transaksi sudah berstatus ${transaction.status}` });
     }
 
     const paidAt = new Date().toISOString();
     await db.run(
       'UPDATE transactions SET status = ?, paid_at = ? WHERE id = ?', 
-      ['SUCCESS', paidAt, id]
+      ['SUCCESS', paidAt, transaction.id]
     );
 
     const merchant = await db.get('SELECT * FROM merchants WHERE id = ?', [transaction.merchant_id]);
     sendCallback({ ...transaction, status: 'SUCCESS', paid_at: paidAt }, merchant);
 
-    res.json({ success: true, message: 'Dikonfirmasi manual', transaction_id: id });
+    res.json({ success: true, message: 'Dikonfirmasi manual', transaction_id: transaction.id });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/find-transfer-target', authenticateMerchant, async (req, res) => {
+  const { amount, bank_name, account_number } = req.body;
+  
+  if (!amount || !bank_name || !account_number) {
+    return res.status(400).json({ success: false, error: 'Data transfer tidak lengkap' });
+  }
+
+  try {
+    const db = await getDb();
+    
+    // Cari transaksi PENDING yang sesuai metode BANK_TRANSFER
+    const pendingTrans = await db.all(
+      `SELECT * FROM transactions WHERE method = 'BANK_TRANSFER' AND status = 'PENDING' AND merchant_id = ? ORDER BY created_at DESC`,
+      [req.merchant.id]
+    );
+
+    let matchedTx = null;
+    for (const t of pendingTrans) {
+      if (t.payment_detail) {
+        try {
+          const detail = JSON.parse(t.payment_detail);
+          const nameMatch = detail.bank_name.toLowerCase().includes(bank_name.toLowerCase()) || bank_name.toLowerCase().includes(detail.bank_name.toLowerCase());
+          if (nameMatch && detail.account_number === account_number && parseFloat(t.amount) === parseFloat(amount)) {
+            matchedTx = t;
+            break;
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (!matchedTx) {
+      return res.status(404).json({ success: false, error: 'Tidak ditemukan tagihan yang cocok dengan data transfer ini' });
+    }
+
+    res.json({ 
+      success: true, 
+      data: {
+        id: matchedTx.id,
+        transaction_id: matchedTx.id,
+        status: matchedTx.status,
+        amount: matchedTx.amount,
+        method: matchedTx.method,
+        payment_detail: matchedTx.payment_detail
+      }
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
