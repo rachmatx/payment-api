@@ -19,9 +19,8 @@ async function verifyPayment(transactionId) {
   return { alreadyProcessed: false, isSuccess };
 }
 
-function generateSignature(payload, secret) {
-  const str = JSON.stringify(payload);
-  return crypto.createHmac('sha256', secret).update(str).digest('hex');
+function generateSignature(rawBodyString, secret) {
+  return crypto.createHmac('sha256', secret).update(rawBodyString).digest('hex');
 }
 
 async function sendCallback(transaction, merchant) {
@@ -33,14 +32,19 @@ async function sendCallback(transaction, merchant) {
     merchant_id: merchant.id,
     amount: transaction.amount,
     method: transaction.method,
-    payment_detail: JSON.parse(transaction.payment_detail || '{}'),
+    payment_detail: transaction.payment_detail ? JSON.parse(transaction.payment_detail) : {},
     paid_at: transaction.paid_at,
   };
 
   try {
-    const signature = generateSignature(payload, merchant.api_key);
+    // Buat raw body string SEKALI — gunakan string yang sama untuk signing DAN mengirim
+    // Ini memastikan HMAC di Node.js == HMAC yang diverifikasi PHP dari raw HTTP body
+    const rawBody = JSON.stringify(payload);
+    const signature = generateSignature(rawBody, merchant.api_key);
     
-    await axios.post(merchant.callback_url, payload, {
+    console.log(`Mengirim callback ke ${merchant.callback_url} untuk transaksi ${transaction.id}`);
+    
+    await axios.post(merchant.callback_url, rawBody, {
       headers: {
         'Content-Type': 'application/json',
         'X-Signature': signature,
@@ -50,7 +54,10 @@ async function sendCallback(transaction, merchant) {
 
     console.log(`Callback berhasil dikirim ke ${merchant.callback_url}`);
   } catch (err) {
-    console.error(`Callback gagal: ${err.message}`);
+    const status = err.response?.status || 'N/A';
+    const responseData = err.response?.data ? JSON.stringify(err.response.data) : 'No response body';
+    console.error(`Callback gagal ke ${merchant.callback_url}: ${err.message} (HTTP ${status})`);
+    console.error(`  Response: ${responseData}`);
   }
 }
 
