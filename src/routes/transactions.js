@@ -2,15 +2,19 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const { getDb } = require('../db');
-const { authenticateMerchant } = require('../middleware/auth');
+const { authenticateMerchant, requireCallbackSigning } = require('../middleware/auth');
 const { verifyPayment, sendCallback } = require('../services/paymentService');
+const { isValidAmount } = require('../services/paymentCallback');
 
-router.post('/', authenticateMerchant, async (req, res) => {
+router.post('/', authenticateMerchant, requireCallbackSigning, async (req, res) => {
   const { amount, method, customer_ref } = req.body;
   const merchant = req.merchant;
 
-  if (!amount || amount <= 0) {
+  if (!isValidAmount(amount)) {
     return res.status(400).json({ success: false, error: 'Amount tidak valid' });
+  }
+  if (typeof customer_ref !== 'string' || !customer_ref.trim() || customer_ref.length > 100 || customer_ref.trim() !== customer_ref) {
+    return res.status(400).json({ success: false, error: 'customer_ref wajib diisi' });
   }
   if (!['QRIS', 'BANK_TRANSFER'].includes(method)) {
     return res.status(400).json({ success: false, error: 'Method harus QRIS atau BANK_TRANSFER' });
@@ -47,6 +51,8 @@ router.post('/', authenticateMerchant, async (req, res) => {
       success: true,
       data: {
         transaction_id: transactionId,
+        merchant_id: merchant.id,
+        customer_ref,
         amount,
         method,
         payment_detail: paymentDetail,
@@ -59,7 +65,7 @@ router.post('/', authenticateMerchant, async (req, res) => {
   }
 });
 
-router.post('/:id/pay', authenticateMerchant, async (req, res) => {
+router.post('/:id/pay', authenticateMerchant, requireCallbackSigning, async (req, res) => {
   const { id } = req.params;
   const merchant = req.merchant;
 
@@ -150,7 +156,7 @@ router.get('/:id/status', authenticateMerchant, async (req, res) => {
   }
 });
 
-router.post('/:id/confirm', authenticateMerchant, async (req, res) => {
+router.post('/:id/confirm', authenticateMerchant, requireCallbackSigning, async (req, res) => {
   const { id } = req.params;
   
   try {

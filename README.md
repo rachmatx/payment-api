@@ -1,6 +1,12 @@
 # Panduan Integrasi: Payment API (Microservice)
 
-Dokumen ini adalah panduan komprehensif untuk menginstal, mengatur, dan mengintegrasikan sistem **Payment API** ke dalam proyek aplikasi Anda (seperti Sistem Kasir, Toko Online, dsb). 
+Pembaruan kontrak webhook dan batas verifikasi terbaru: [Webhook integrity](docs/webhook-integrity.md).
+Contoh webhook lama di bawah hanya menjelaskan HMAC; penerima Laundry terbaru juga
+mewajibkan secret server `PAYMENT_WEBHOOK_SECRET` yang terpisah dari key merchant,
+kecocokan intent/nominal dan deduplikasi transaksi. Verifikasi provider
+pada proyek ini masih simulasi.
+
+Dokumen ini adalah panduan komprehensif untuk menginstal, mengatur, dan mengintegrasikan sistem **Payment API** ke dalam proyek aplikasi Anda (seperti Sistem Kasir, Toko Online, dsb).
 
 Payment API dibangun sebagai *Microservice* terpisah (menggunakan Node.js & SQLite). Tujuannya adalah menjadi layanan mandiri yang mengelola pembuatan tagihan dan mengirimkan notifikasi lunas (*Webhook*) ke aplikasi utama Anda.
 
@@ -40,11 +46,12 @@ API ini menggunakan database SQLite (`src/db/database.sqlite`). Untuk bisa mengg
 Di dalam proyek ini, sudah disediakan script untuk mengisi data percobaan (*seed*).
 1. Buka file `src/db/seed.js` (atau jalankan perintah *seed* yang disediakan). Di sana terdapat kode untuk mendaftarkan toko Anda:
    ```javascript
-   db.run("INSERT INTO merchants (id, name, api_key, callback_url, qris_data, bank_name, account_number, account_holder) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
-   ['M1', 'Toko Anda', 'API-KEY-123', 'http://localhost/proyek_anda/webhook', ...]);
+   db.run("INSERT INTO merchants (id, name, api_key, webhook_secret, callback_url, qris_data, bank_name, account_number, account_holder) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+   ['M1', 'Toko Anda', 'API-KEY-123', 'SECRET-KHUSUS-SERVER', 'http://localhost/proyek_anda/webhook', ...]);
    ```
 2. Dari kode di atas:
    - **API Key** Anda adalah `API-KEY-123`. Ini ibarat kata sandi untuk berkomunikasi dengan API.
+   - **Webhook Secret** adalah kunci khusus server, berbeda dari API key; nilainya harus cocok dengan `PAYMENT_WEBHOOK_SECRET` pada Laundry.
    - **Callback URL (Webhook)** adalah alamat di web PHP Anda yang akan menerima pesan saat lunas. **PENTING:** Sesuaikan URL ini dengan *localhost* atau domain asli web Anda.
 3. Jalankan API Server Anda:
    ```bash
@@ -65,6 +72,8 @@ Di aplikasi PHP Anda (misal CodeIgniter), buka file `.env` Anda dan tambahkan kr
 PAYMENT_API_URL = 'http://localhost:3000/api/transactions'
 # API Key yang Anda dapatkan dari database Payment API tadi
 PAYMENT_API_KEY = 'API-KEY-123'
+# Secret HMAC khusus server, berbeda dari API key dan sama pada kedua backend
+PAYMENT_WEBHOOK_SECRET = 'ISI-SECRET-SERVER-YANG-BERBEDA'
 ```
 
 ### B. Mengirim Permintaan Tagihan
@@ -89,7 +98,7 @@ curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
 $response = curl_exec($ch);
 $result = json_decode($response, true);
 
-// Jika sukses, API mengembalikan ID khusus. 
+// Jika sukses, API mengembalikan ID khusus.
 // Simpan $result['data']['transaction_id'] ke database Anda.
 ```
 
@@ -115,7 +124,10 @@ $rawBody = $this->request->getBody(); // atau file_get_contents('php://input');
 
 // 2. Ambil tanda tangan dari Header
 $signature = $this->request->getHeaderLine('X-Signature');
-$secret = getenv('PAYMENT_API_KEY'); 
+$secret = getenv('PAYMENT_WEBHOOK_SECRET');
+if (!is_string($secret) || trim($secret) === '') {
+    return $this->failServerError('Webhook belum dikonfigurasi');
+}
 
 // 3. Hitung ulang tanda tangan
 $expectedSignature = hash_hmac('sha256', $rawBody, $secret);
@@ -128,7 +140,8 @@ if (!hash_equals($expectedSignature, $signature)) {
 // 5. Ubah database jika aman!
 $data = json_decode($rawBody, true);
 if ($data['event'] === 'payment.success') {
-    // Lakukan aksi: UPDATE tabel_transaksi SET status = 'Lunas' WHERE api_id = $data['transaction_id'];
+    // Validasi terhadap intent dan terapkan secara atomik; jangan update lunas langsung.
+    $duplicate = (new \App\Services\PaymentSettlementService())->apply($data);
 }
 ```
 
@@ -140,7 +153,7 @@ Meskipun database Anda sudah "Lunas" karena ditebak oleh Webhook, halaman web Ka
 
 1. **Buat Endpoint Sederhana di Backend Anda:**
    Buat URL seperti `/transaksi/cek_status_bayar/001` yang hanya membalas JSON sederhana: `{"sisa_tagihan": 0}`.
-   
+
 2. **Pasang Script ini di Halaman HTML/View Kasir Anda:**
 ```javascript
 // Cek ke server setiap 3 detik
@@ -158,7 +171,7 @@ let interval = setInterval(function() {
                     confirmButtonText: 'OK'
                 }).then(() => {
                     // Muat ulang layar kasir
-                    window.location.reload(); 
+                    window.location.reload();
                 });
             }
         });
@@ -209,6 +222,6 @@ Setelah deploy sukses di Railway, Anda akan mendapatkan domain publik (misal: `h
 
 > [!CAUTION]
 > **Data Ephemeral (Sementara):**
-> File `data/database.sqlite` tersimpan di dalam Container Docker. Artinya, **setiap kali Anda deploy ulang atau Railway melakukan restart container**, database pembayaran SQLite ini akan tereset dan kosong lagi. 
+> File `data/database.sqlite` tersimpan di dalam Container Docker. Artinya, **setiap kali Anda deploy ulang atau Railway melakukan restart container**, database pembayaran SQLite ini akan tereset dan kosong lagi.
 > - Jika API ini hanya dipakai untuk *MOCK/Dummy testing pembayaran* untuk demo skripsi, maka di-reset otomatis ini malah bagus karena tidak menghabiskan kuota disk.
 > - Namun jika Anda ingin riwayat datanya permanen, Anda **wajib masuk ke menu Volumes di Railway** dan me-*mount* volume tersebut ke direktori `/app/data` di dalam container.

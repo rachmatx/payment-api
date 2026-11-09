@@ -1,4 +1,5 @@
 const { getDb } = require('../db');
+const { callbackConfigured } = require('../services/paymentCallback');
 
 async function authenticateMerchant(req, res, next) {
   const apiKey = req.headers['x-api-key'];
@@ -32,4 +33,11 @@ async function authenticateMerchant(req, res, next) {
   }
 }
 
-module.exports = { authenticateMerchant };
+function requireCallbackSigning(req, res, next) {
+  if (!callbackConfigured(req.merchant)) {
+    return res.status(503).json({ success: false, error: 'Server webhook signing key belum dikonfigurasi' });
+  }
+  next();
+}
+
+module.exports = { authenticateMerchant, requireCallbackSigning };

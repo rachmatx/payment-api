@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS merchants (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   api_key TEXT UNIQUE NOT NULL,
+  webhook_secret TEXT,
   callback_url TEXT,
   qris_data TEXT,
   bank_name TEXT,
