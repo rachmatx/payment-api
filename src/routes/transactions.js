@@ -1,191 +1,80 @@
 const express = require('express');
 const router = express.Router();
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('node:crypto');
 const { getDb } = require('../db');
 const { authenticateMerchant, requireCallbackSigning } = require('../middleware/auth');
 const { verifyPayment, sendCallback } = require('../services/paymentService');
 const { isValidAmount } = require('../services/paymentCallback');
+const { simulationDetails, presentation, signedResponse } = require('../services/mobilePayment');
 
 router.post('/', authenticateMerchant, requireCallbackSigning, async (req, res) => {
-  const { amount, method, customer_ref } = req.body;
+  const { amount, method, customer_ref } = req.body || {};
   const merchant = req.merchant;
-
-  if (!isValidAmount(amount)) {
-    return res.status(400).json({ success: false, error: 'Amount tidak valid' });
+  const requestKey = req.get('Idempotency-Key') || null;
+  if (!isValidAmount(amount) || !['QRIS', 'BANK_TRANSFER'].includes(method)
+      || typeof customer_ref !== 'string' || !customer_ref.trim() || customer_ref.length > 100
+      || customer_ref.trim() !== customer_ref || (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey))) {
+    return res.status(400).json({ success: false, error: 'Data tagihan tidak valid' });
   }
-  if (typeof customer_ref !== 'string' || !customer_ref.trim() || customer_ref.length > 100 || customer_ref.trim() !== customer_ref) {
-    return res.status(400).json({ success: false, error: 'customer_ref wajib diisi' });
-  }
-  if (!['QRIS', 'BANK_TRANSFER'].includes(method)) {
-    return res.status(400).json({ success: false, error: 'Method harus QRIS atau BANK_TRANSFER' });
-  }
-
-  let paymentDetail;
-  if (method === 'QRIS') {
-    paymentDetail = {
-      qris_data: merchant.qris_data || `QRIS-DUMMY-${merchant.id}`,
-      merchant_name: merchant.name,
-    };
-  } else {
-    paymentDetail = {
-      bank_name: merchant.bank_name || 'Bank Dummy',
-      account_number: merchant.account_number || '123456789',
-      account_holder: merchant.account_holder || merchant.name,
-    };
-  }
-
-  const transactionId = uuidv4();
-  const expiredAt = new Date(Date.now() + 15 * 60 * 1000);
-
   try {
     const db = await getDb();
-    await db.run(
-      `INSERT INTO transactions 
-       (id, merchant_id, amount, method, status, customer_ref, payment_detail, expired_at)
-       VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
-      [transactionId, merchant.id, amount, method, customer_ref, 
-       JSON.stringify(paymentDetail), expiredAt.toISOString()]
-    );
-
-    res.status(201).json({
-      success: true,
-      data: {
-        transaction_id: transactionId,
-        merchant_id: merchant.id,
-        customer_ref,
-        amount,
-        method,
-        payment_detail: paymentDetail,
-        expired_at: expiredAt,
-        status: 'PENDING',
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+    const id = randomUUID();
+    const expiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const detail = simulationDetails({ id, method }, merchant);
+    const inserted = await db.run(`INSERT INTO transactions (id, merchant_id, amount, method, status, customer_ref, idempotency_key, payment_detail, expired_at)
+      VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?, ?) ON CONFLICT(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+      [id, merchant.id, amount, method, customer_ref, requestKey, JSON.stringify(detail), expiry]);
+    const transaction = requestKey
+      ? await db.get('SELECT * FROM transactions WHERE merchant_id = ? AND idempotency_key = ?', [merchant.id, requestKey])
+      : await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
+    if (transaction.amount !== amount || transaction.method !== method || transaction.customer_ref !== customer_ref) {
+      return res.status(409).json({ success: false, error: 'Idempotency key dipakai untuk tagihan berbeda' });
+    }
+    return signedResponse(res, inserted.changes ? 201 : 200, transaction, merchant);
+  } catch { return res.status(500).json({ success: false, error: 'Gagal menyiapkan tagihan' }); }
 });
 
-router.post('/:id/pay', authenticateMerchant, requireCallbackSigning, async (req, res) => {
-  const { id } = req.params;
-  const merchant = req.merchant;
+async function findTransaction(db, id, merchantId) {
+  return db.get('SELECT * FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1', [id, id, merchantId]);
+}
 
+async function settle(req, res) {
   try {
     const db = await getDb();
-    const transaction = await db.get(
-      'SELECT * FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC LIMIT 1', 
-      [id, id, merchant.id]
-    );
-
-    if (!transaction) {
-      return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
-    }
-    if (transaction.status !== 'PENDING') {
-      return res.status(409).json({ 
-        success: false, 
-        error: `Transaksi sudah berstatus ${transaction.status}` 
-      });
-    }
-    if (new Date() > new Date(transaction.expired_at)) {
-      await db.run('UPDATE transactions SET status = ? WHERE id = ?', ['EXPIRED', transaction.id]);
-      return res.status(410).json({ success: false, error: 'Transaksi sudah expired' });
-    }
-
-    const { alreadyProcessed, isSuccess } = await verifyPayment(transaction.id);
-
-    if (alreadyProcessed) {
-      return res.status(409).json({ success: false, error: 'Sudah diproses' });
-    }
-
-    if (isSuccess) {
-      const paidAt = new Date().toISOString();
-      await db.run(
-        'UPDATE transactions SET status = ?, paid_at = ? WHERE id = ?', 
-        ['SUCCESS', paidAt, transaction.id]
-      );
-      
-      const updatedTrx = await db.get('SELECT * FROM transactions WHERE id = ?', [transaction.id]);
-      sendCallback(updatedTrx, merchant);
-
-      return res.json({
-        success: true,
-        data: {
-          transaction_id: transaction.id,
-          status: 'SUCCESS',
-          amount: transaction.amount,
-          method: transaction.method,
-          paid_at: paidAt,
-        }
-      });
-    } else {
-      await db.run('UPDATE transactions SET status = ? WHERE id = ?', ['FAILED', transaction.id]);
-      return res.status(402).json({ success: false, error: 'Pembayaran gagal diverifikasi' });
-    }
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+    const transaction = await findTransaction(db, req.params.id, req.merchant.id);
+    if (!transaction) return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
+    if (presentation(transaction, req.merchant).status === 'EXPIRED') return res.status(410).json({ success: false, error: 'Transaksi kedaluwarsa' });
+    const verified = await verifyPayment(transaction.id); // Still explicitly a simulator.
+    if (verified.alreadyProcessed || !verified.isSuccess) return res.status(409).json({ success: false, error: 'Transaksi sudah diproses' });
+    const now = new Date().toISOString();
+    const result = await db.run("UPDATE transactions SET status = 'SUCCESS', paid_at = ? WHERE id = ? AND status = 'PENDING' AND expired_at > ?", [now, transaction.id, now]);
+    if (!result.changes) return res.status(409).json({ success: false, error: 'Status tagihan sudah berubah' });
+    const updated = await db.get('SELECT * FROM transactions WHERE id = ?', [transaction.id]);
+    void sendCallback(updated, req.merchant);
+    return signedResponse(res, 200, updated, req.merchant);
+  } catch { return res.status(500).json({ success: false, error: 'Gagal memproses pembayaran' }); }
+}
+router.post('/:id/pay', authenticateMerchant, requireCallbackSigning, settle);
+router.post('/:id/confirm', authenticateMerchant, requireCallbackSigning, settle);
+router.post('/:id/cancel', authenticateMerchant, requireCallbackSigning, async (req, res) => {
+  try {
+    const db = await getDb();
+    const transaction = await findTransaction(db, req.params.id, req.merchant.id);
+    if (!transaction) return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
+    await db.run("UPDATE transactions SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'", [transaction.id]);
+    return signedResponse(res, 200, await db.get('SELECT * FROM transactions WHERE id = ?', [transaction.id]), req.merchant);
+  } catch { return res.status(500).json({ success: false, error: 'Pembatalan belum terkonfirmasi' }); }
 });
-
+router.get('/:id/status', authenticateMerchant, requireCallbackSigning, async (req, res) => {
+  try {
+    const transaction = await findTransaction(await getDb(), req.params.id, req.merchant.id);
+    if (!transaction) return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
+    return signedResponse(res, 200, transaction, req.merchant);
+  } catch { return res.status(500).json({ success: false, error: 'Status belum dapat diperiksa' }); }
+});
 router.get('/', authenticateMerchant, async (req, res) => {
-  try {
-    const db = await getDb();
-    const transactions = await db.all(
-      'SELECT id, amount, method, status, created_at, paid_at FROM transactions WHERE merchant_id = ? ORDER BY created_at DESC LIMIT 10',
-      [req.merchant.id]
-    );
-    res.json({ success: true, data: transactions });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-router.get('/:id/status', authenticateMerchant, async (req, res) => {
-  try {
-    const db = await getDb();
-    const transaction = await db.get(
-      'SELECT id, amount, method, status, payment_detail, paid_at, expired_at FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC LIMIT 1',
-      [req.params.id, req.params.id, req.merchant.id]
-    );
-
-    if (!transaction) {
-      return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
-    }
-
-    res.json({ success: true, data: transaction });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-router.post('/:id/confirm', authenticateMerchant, requireCallbackSigning, async (req, res) => {
-  const { id } = req.params;
-  
-  try {
-    const db = await getDb();
-    const transaction = await db.get(
-      'SELECT * FROM transactions WHERE (id = ? OR customer_ref = ?) AND merchant_id = ? ORDER BY created_at DESC LIMIT 1', 
-      [id, id, req.merchant.id]
-    );
-
-    if (!transaction) {
-      return res.status(404).json({ success: false, error: 'Transaksi tidak ditemukan' });
-    }
-    if (transaction.status !== 'PENDING') {
-      return res.status(409).json({ success: false, error: `Transaksi sudah berstatus ${transaction.status}` });
-    }
-
-    const paidAt = new Date().toISOString();
-    await db.run(
-      'UPDATE transactions SET status = ?, paid_at = ? WHERE id = ?', 
-      ['SUCCESS', paidAt, transaction.id]
-    );
-
-    const merchant = await db.get('SELECT * FROM merchants WHERE id = ?', [transaction.merchant_id]);
-    sendCallback({ ...transaction, status: 'SUCCESS', paid_at: paidAt }, merchant);
-
-    res.json({ success: true, message: 'Dikonfirmasi manual', transaction_id: transaction.id });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  const rows = await (await getDb()).all('SELECT id, amount, method, status, created_at, paid_at FROM transactions WHERE merchant_id = ? ORDER BY created_at DESC LIMIT 10', [req.merchant.id]);
+  res.json({ success: true, data: rows });
 });
 
 router.post('/find-transfer-target', authenticateMerchant, async (req, res) => {

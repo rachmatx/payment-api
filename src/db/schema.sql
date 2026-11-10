@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   method TEXT NOT NULL,
   status TEXT DEFAULT 'PENDING',
   customer_ref TEXT,
+  idempotency_key TEXT,
   payment_detail TEXT,
   paid_at DATETIME,
   expired_at DATETIME,

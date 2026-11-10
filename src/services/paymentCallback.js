@@ -12,7 +12,7 @@ function generateSignature(rawBody, secret) {
 }
 
 function callbackConfigured(merchant) {
-  return !merchant.callback_url || (typeof merchant.webhook_secret === 'string'
+  return (typeof merchant.webhook_secret === 'string'
     && !!merchant.webhook_secret.trim() && merchant.webhook_secret !== merchant.api_key);
 }
 
@@ -29,6 +29,7 @@ function buildSignedCallback(transaction, merchant) {
   }
   const payload = {
     event: 'payment.success',
+    mode: 'SIMULATION',
     transaction_id: transaction.id,
     merchant_id: merchant.id,
     customer_ref: transaction.customer_ref,

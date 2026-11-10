@@ -2,33 +2,17 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { getDb } = require('./db');
-const transactionRoutes = require('./routes/transactions');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(cors());
-app.use(express.json());
-
-app.use('/api/transactions', transactionRoutes);
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Payment API is running' });
-});
-
-async function startServer() {
-  try {
-    await getDb(); // Initialize database
-    console.log('Database initialized successfully');
-    
-    app.listen(PORT, () => {
-      console.log(`Payment API Service listening on port ${PORT}`);
-    });
-  } catch (err) {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  }
+function createApp() {
+  const app = express();
+  app.use(cors());
+  app.use(express.json());
+  app.use('/api/transactions', require('./routes/transactions'));
+  app.get('/health', (req, res) => res.json({ status: 'OK', mode: 'SIMULATION' }));
+  return app;
 }
-
-startServer();
+async function startServer() {
+  await getDb();
+  return createApp().listen(process.env.PORT || 3000, '0.0.0.0');
+}
+if (require.main === module) startServer().catch(() => { console.error('Payment API startup failed; verify private configuration.'); process.exitCode = 1; });
+module.exports = { createApp, startServer };
